@@ -1,0 +1,231 @@
+# 主观 Y/N：Y 部分主观 + 协方差估计
+
+from sklearn.covariance import ledoit_wolf
+from scipy.optimize import minimize
+from Backtest import *
+
+import matplotlib
+
+matplotlib.use('Agg')  # 设置不显示图片 必须在导入pyplot之前
+from matplotlib import pyplot as plt
+
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 指定默认字体
+plt.rcParams['axes.unicode_minus'] = False
+from pandas.plotting import register_matplotlib_converters
+
+register_matplotlib_converters()
+
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+def risk_parity_weights(cov, iternum=1000):
+    def objective(weights, cov):
+        '''
+        定义风险平价优化的目标函数
+        '''
+        # 组合标准差
+        sigma = np.sqrt(np.dot(weights, np.dot(cov, weights)))  # 非年化
+        # 资产对组合的边际风险贡献：组合波动率对权重的偏导数
+        # MRC = cov @ weights / sigma
+        # MRC是向量
+        MRC = np.dot(cov, weights) / sigma
+        # 资产对总风险的贡献：该资产权重与其边际风险贡献的乘积
+        # TRC是向量
+        TRC = weights * MRC
+        # 求资产对组合风险贡献差值的最小值
+        delta_TRC = [sum((i - TRC) ** 2) for i in TRC]
+        return sum(delta_TRC)
+
+    # 初始权重
+    initial_weights = np.ones(cov.shape[0]) / cov.shape[0]
+
+    # 约束条件（权重之和为1）
+    '''
+    示例：
+    constraints = [{'type': 'eq', 'fun': lambda x: x[0] + 2 * x[1] - 1},
+               {'type': 'ineq', 'fun': lambda x: x[0] ** 2 + x[1] - 2}]
+    第一个约束是等式约束（'eq'），指定了x[0] + 2x[1]必须等于1；
+    第二个约束是不等式约束（'ineq'），指定了 x[0]^2 + x[1]必须大于等于2。
+    '''
+    constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+    # {'type': 'ineq', 'fun': lambda w: w}
+    # 这是一个不等式约束（'ineq'）。fun键对应的函数简单地返回输入向量'w'，
+    # 根据scipy.optimize.minimize的文档，不等式约束被认为是满足条件的，
+    # 如果'fun'返回的结果大于等于0。因此，这个约束确保了'w'中的每个元素都必须是非负的。
+
+    # 权重范围
+    bounds = tuple((-1, 5) for asset in initial_weights)
+
+    #  "disp": boolean - print detailed description
+    #  "maxiter": int - maximum number of iterations to perform.
+    #  "gtol": int - the tolerance of the error
+    options = {'disp': False, 'maxiter': iternum, 'ftol': 1e-10}
+
+    # 优化
+    result = minimize(objective, initial_weights, method='SLSQP', args=(cov,), bounds=bounds,
+                      constraints=constraints, options=options)
+
+    ret_portfolio_variance = np.sqrt(result.x.T @ cov @ result.x) * np.sqrt(240)  # 年化组合波动
+
+    if result.success:
+        return result.x, ret_portfolio_variance
+    else:
+        raise ValueError("Optimization failed.")
+
+
+'''#####################################################  数据  #####################################################'''
+
+straname = 'QQ'
+df = pd.read_excel(r'资产每日数据.xlsx', index_col=0)
+df.index = pd.to_datetime(df.index)
+date1 = '2015-03-20'  # T.CFE 10年期国债
+date2 = '2016-05-12'  # UC.SG A50
+date3 = '2018-03-20'  # SCFI.WI 沪油
+all_data = df[['TU.CBT', 'UC.SG', 'MGC.CMX', 'CN.SG', 'CL.NYM']].copy()
+# all_data = df[['TY.CBT', 'TLT.O', 'T.CFE', 'UC.SG',
+#                'USDJPY.FX', 'AGFI.WI', 'MGC.CMX', 'AUFI.wi', '000852.sh', 'IF.CFE',
+#                'CN.SG', 'HHIF.HK', 'ES.CME', 'N225.GI', 'RBFI.WI', 'ifi.wi', 'ALFI.WI',
+#                'CUFI.WI', 'HG.CMX', 'CL.NYM']].copy()  # 剔除2年期美债、30年期中债、美元指数期货、沪油
+'''
+['TU.CBT', 'TY.CBT', 'TLT.O', 'T.CFE', 'TL.CFE', 'UC.SG', 'DX.NYB',
+       'USDJPY.FX', 'AGFI.WI', 'MGC.CMX', 'AUFI.wi', '000852.sh', 'IF.CFE',
+       'CN.SG', 'HHIF.HK', 'ES.CME', 'N225.GI', 'RBFI.WI', 'ifi.wi', 'ALFI.WI',
+       'CUFI.WI', 'HG.CMX', 'SCFI.WI', 'CL.NYM']
+'''
+
+all_data = all_data[(all_data.index >= date2)].copy()
+all_data = all_data.fillna(method='pad')
+# # 持仓日期
+Hold_date = position_date(all_data, vPeriod="month", Is_yc="ym")
+for i_col in all_data.columns:
+    all_data[i_col] = all_data[i_col] / (all_data[i_col].values[0])  # 转为净值序列
+# # 对数收益率
+df_return = np.log(all_data / all_data.shift(1))
+df_return = df_return.dropna()
+
+'''#####################################################  参数  #####################################################'''
+
+rollingtimeinput = int(240)  # 此参数为回看历史windows
+vPeriod = "month"  # 调仓周期: week周频, month月频, quarter季频, halfyear半年, year一年
+Is_yc = 'ym'  # 调仓时间点: yc期初, ym期末
+IS_zg = 'N'  # 是否主动判断相关性Y为主观判断，N为非主观判读
+target_sigma = 0.12  # 设置目标年化波动率
+
+'''#####################################################  截面  #####################################################'''
+
+# ### 方差矩阵的Ledoit-Wolf（LW）估计
+lw_cov, _ = ledoit_wolf(df_return.tail(n=rollingtimeinput).values)  # 估计了历史n窗口期的协方差矩阵
+cov_df = pd.DataFrame(lw_cov)
+cov_df.columns = df_return.columns
+cov_df.index = df_return.columns
+cor_df = cov2corr(cov_df)  # 从协方差矩阵cov_df导出相关矩阵cor_df
+
+# ### 可以手动在此调整协方差矩阵
+corrr = 0.5
+if IS_zg == 'Y':
+    print('请添加相关系数观点')
+    cor_df_new = pd.DataFrame([[1, corrr], [corrr, 1]])
+    std_new = np.sqrt(np.diag(cov_df))
+    cov_df = corr2cov(cor_df_new, std_new)
+
+weights, stre_Sigma = risk_parity_weights(cov_df, iternum=2000)
+print(df_return.index.max())
+w_ = pd.DataFrame(weights, index=df_return.columns.to_list(), columns=['权重']).T
+print("最新一期资产配置的风险平价权重：", w_.T)
+print('此配置下组合年化波动率', round(stre_Sigma, 3))
+print('在此' + str(target_sigma) + '目标年化波动率下的杠杆水平为：', round(target_sigma / stre_Sigma, 3))
+w_l = pd.DataFrame(weights * target_sigma / stre_Sigma, index=df_return.columns.to_list(), columns=['权重_杠杆']).T
+print('最新一期加杠杆后的配置结果：', w_l.T)
+# # 某资产杠杆 = 某资产市值 / 净资产总额
+# # 某资产杠杆 * 净资产总额 = 某资产市值
+
+
+'''#####################################################  序列  #####################################################'''
+
+
+def get_nav(start_date='2020-06-30', end_date='2024-01-31', rollingtime=240):
+    '''
+    start_date: 权重开始时间
+    end_date: 权重截止时间
+    '''
+    weights_df = pd.DataFrame()  # 权重
+    weights_df_L = pd.DataFrame()  # 调整杠杆后权重
+    # # 权重区间
+    Hold_date_test = Hold_date[Hold_date.index(start_date):Hold_date.index(end_date) + 1].copy()
+    # # 计算每期权重
+    for i_date in Hold_date_test:
+        Tmp = df_return[df_return.index < i_date].tail(n=rollingtime)
+        lw_cov, _ = ledoit_wolf(Tmp.values)
+        cov_df = pd.DataFrame(lw_cov)
+        cov_df.columns = df_return.columns
+        cov_df.index = df_return.columns
+        tmp_weights, stre_Sigma = risk_parity_weights(cov_df, iternum=1000)
+        tmp_list = tmp_weights.tolist()  # 配置结果
+        L = target_sigma / stre_Sigma  # 目标波动率下的杠杆水平（年化/年化）
+        tmp_list_l = [x * L for x in tmp_list]  # 加杠杆后的配置结果
+        weights_df = pd.concat([weights_df, pd.DataFrame([i_date] + tmp_list + [stre_Sigma]).T])
+        weights_df_L = pd.concat([weights_df_L, pd.DataFrame([i_date] + tmp_list_l + [stre_Sigma]).T])
+    cols = df_return.columns.tolist()
+    weights_df.columns = ['ValueDate'] + cols + ['年化组合波动']
+    weights_df.to_excel(
+        'Output/每期权重_开始时间' + start_date.replace('-', '') + '_结束时间' + end_date.replace('-', '') + '_' + str(
+            straname) + str(rollingtime) + '.xlsx', index=False)
+    weights_df_L.columns = ['ValueDate'] + cols + ['年化组合波动']
+    weights_df_L.to_excel(
+        'Output/每期权重_杠杆_开始时间' + start_date.replace('-', '') + '_结束时间' + end_date.replace('-',
+                                                                                                       '') + '_' + str(
+            straname) + str(rollingtime) + '.xlsx', index=False)
+    del weights_df_L['年化组合波动']
+    # # 变换为长型矩阵
+    melted_df = pd.melt(weights_df_L, id_vars=['ValueDate'], var_name='S_INFO_WINDCODE', value_name='Weight')
+    melted_df.columns = ['Date', 'S_INFO_WINDCODE', 'Weight_L']
+
+    # ### 回测结果
+    Nav_df = Back_test(melted_df, all_data, vfee=0)  # 全时间段净值序列
+    Nav_df = pd.merge(Nav_df, all_data, left_index=True, right_index=True)  # 组合净值+各资产净值
+    Nav_df.to_excel(
+        'Output/策略净值_开始日期' + Nav_df.index[0].strftime('%Y%m%d') + '_截止日期' + Nav_df.index[-1].strftime(
+            '%Y%m%d') + '_滚动' + str(rollingtime) + '天.xlsx')
+
+    nav = Nav_df['Nav']  # Series
+    windows = 60  # 波动率滚动窗口
+    roll_annual_vol = RollannVolatility(nav, windows=windows)  # 滚动波动率序列
+
+    EVA_df = pd.DataFrame([accumReturn(nav), annReturn(nav, annual_day=240), annVolatility(nav, annual_day=240),
+                           sharpRatio(nav, annual_day=240), max_drawdown(nav)], ).T
+    EVA_df.columns = ['累积收益率', '年化收益率', '年化波动率', '夏普比', '最大回撤']
+    EVA_df.index = [Nav_df.index[-1]]
+    print(EVA_df)
+
+    '''#####################################################  绘图  #####################################################'''
+
+    fig_df = pd.DataFrame(nav)
+    fig_df['vol'] = roll_annual_vol
+    fig_df = fig_df.dropna()
+    x = fig_df.index
+
+    fig = plt.figure(figsize=(10, 5), dpi=200)
+    ax = plt.gca()
+    ax2 = ax.twinx()
+    line1, = ax.plot(x, fig_df['Nav'], color='black')
+    volmin = fig_df['vol'].min()
+    line2 = ax2.fill_between(x, volmin, fig_df['vol'], color='C1', alpha=0.1)
+    # line2 = ax2.bar(x, fig_df['vol'], width=0.5, color='C1', alpha=0.2)
+    monthsLoc = matplotlib.dates.MonthLocator(interval=3)  # 设置x轴的刻度，间隔为1个月
+    ax.xaxis.set_major_locator(monthsLoc)
+    fig.autofmt_xdate()  # 开启自适应
+    plt.title(
+        '策略_开始日期' + Nav_df.index[0].strftime('%Y%m%d') + '_截止日期' + Nav_df.index[-1].strftime(
+            '%Y%m%d') + '_滚动' + str(rollingtime) + '天')  # 设置标题
+    plt.legend((line1, line2), ('净值', '滚动' + str(windows) + '天年化波动(右轴)'),
+               loc='lower center', bbox_to_anchor=(0.5, -0.25), ncol=2)  # 设置图例
+    plt.savefig(
+        r'滚动' + str(windows) + '天年化波动_开始日期' + Nav_df.index[0].strftime('%Y%m%d') + '_截止日期' +
+        Nav_df.index[
+            -1].strftime('%Y%m%d') + '_滚动' + str(rollingtime) + '天')  # 保存图片
+    plt.close()
+
+
+get_nav(start_date='2023-10-31', end_date='2024-01-31', rollingtime=240)
